@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Group Chat</title>
+<style>
+  :root {
+    --bg: #f7f6f3; --panel: #ffffff; --text: #1d1c1a; --muted: #75716b;
+    --line: #e6e3dd; --me: #2f5bd3; --me-text: #fff; --other: #ece9e3;
+    --ai: #fbf3e6; --ai-line: #ecd9b8; --accent: #c4672b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161514; --panel: #1f1e1c; --text: #ecebe8; --muted: #9a958e;
+      --line: #33312e; --me: #3d6be0; --me-text: #fff; --other: #2b2a27;
+      --ai: #2a241b; --ai-line: #4a3d28; --accent: #e08a4f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  button, input, textarea { font: inherit; color: inherit; }
+  button {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 8px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  input, textarea {
+    width: 100%; border: 1px solid var(--line); background: var(--panel);
+    border-radius: 8px; padding: 9px 11px; outline: none;
+  }
+  input:focus, textarea:focus { border-color: var(--accent); }
+
+  /* Landing / name gate */
+  .center { min-height: 100%; display: grid; place-items: center; padding: 16px; }
+  .card {
+    width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 24px; display: grid; gap: 12px;
+  }
+  .card h1 { margin: 0; font-size: 20px; }
+  .card p { margin: 0; color: var(--muted); }
+
+  /* Chat layout */
+  .app { height: 100%; display: flex; flex-direction: column; max-width: 820px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--line); flex-wrap: wrap;
+  }
+  header .title { font-weight: 600; margin-right: auto; }
+  .presence { color: var(--muted); font-size: 13px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #3aa55d; margin-right: 5px; }
+
+  .prompt-panel {
+    border-bottom: 1px solid var(--line); padding: 12px 16px; display: grid; gap: 8px;
+    background: var(--panel);
+  }
+  .prompt-panel textarea { min-height: 90px; resize: vertical; }
+  .prompt-panel .row { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  .prompt-panel .hint { color: var(--muted); font-size: 13px; margin-right: auto; }
+
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 78%; display: grid; gap: 2px; }
+  .msg .who { font-size: 12px; color: var(--muted); padding: 0 4px; }
+  .msg .bubble {
+    padding: 8px 12px; border-radius: 14px; background: var(--other);
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .msg.me { align-self: flex-end; }
+  .msg.me .who { text-align: right; }
+  .msg.me .bubble { background: var(--me); color: var(--me-text); }
+  .msg.ai .bubble { background: var(--ai); border: 1px solid var(--ai-line); }
+  .msg.ai .who { color: var(--accent); font-weight: 600; }
+  .note { align-self: center; font-size: 12px; color: var(--muted); }
+  .typing::after { content: "▍"; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .empty { margin: auto; text-align: center; color: var(--muted); max-width: 340px; }
+
+  form.compose { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  form.compose textarea { resize: none; height: 42px; max-height: 160px; }
+
+  .toast {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 6px 12px; border-radius: 8px;
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (sel, el = document) => el.querySelector(sel);
+const root = $("#root");
+const roomId = location.pathname.match(/^\/r\/([\w-]+)/)?.[1];
+
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+let myName = store.get("gc-name") || "";
+
+function toast(text) {
+  const t = $("#toast");
+  t.textContent = text;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 1600);
+}
+
+function esc(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+}
+
+// ---- Name gate / landing -----------------------------------------------
+
+function nameCard({ title, blurb, button, onSubmit }) {
+  root.innerHTML = `
+    <div class="center"><form class="card">
+      <h1>${title}</h1><p>${blurb}</p>
+      <input name="name" placeholder="Your name" maxlength="40" autocomplete="off" required value="${esc(myName)}" />
+      <button class="primary">${button}</button>
+    </form></div>`;
+  const form = $("form", root);
+  $("input", form).focus();
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    myName = form.name.value.trim();
+    if (!myName) return;
+    store.set("gc-name", myName);
+    $("button", form).disabled = true;
+    await onSubmit();
+  };
+}
+
+if (!roomId) {
+  nameCard({
+    title: "Start a group chat",
+    blurb: "Chat with Claude, then share the link so someone else can join the same conversation.",
+    button: "Create chat",
+    onSubmit: async () => {
+      const res = await fetch("/api/rooms", { method: "POST" });
+      const { id } = await res.json();
+      location.href = `/r/${id}`;
+    },
+  });
+} else {
+  fetch(`/api/rooms/${roomId}`).then(async (res) => {
+    if (!res.ok) {
+      root.innerHTML = `<div class="center"><div class="card"><h1>Chat not found</h1>
+        <p>This link may be wrong or the chat was removed.</p><a href="/"><button>Start a new chat</button></a></div></div>`;
+      return;
+    }
+    const room = await res.json();
+    if (myName) return enterRoom(room);
+    nameCard({
+      title: "Join this chat",
+      blurb: "You've been invited to a group chat with Claude.",
+      button: "Join",
+      onSubmit: async () => enterRoom(room),
+    });
+  });
+}
+
+// ---- Room --------------------------------------------------------------
+
+function enterRoom(room) {
+  root.innerHTML = `
+    <div class="app">
+      <header>
+        <span class="title">Group chat</span>
+        <span class="presence" id="presence"></span>
+        <button id="promptBtn">System prompt</button>
+        <button id="shareBtn" class="primary">Copy invite link</button>
+      </header>
+      <div class="prompt-panel" id="promptPanel" hidden>
+        <textarea id="promptText"></textarea>
+        <div class="row">
+          <span class="hint">Anyone in the chat can edit this. It applies from the next reply on.</span>
+          <button type="button" id="promptCancel">Cancel</button>
+          <button type="button" id="promptSave" class="primary">Save</button>
+        </div>
+      </div>
+      <div id="log"></div>
+      <form class="compose" id="compose">
+        <textarea id="input" placeholder="Message the group…" rows="1"></textarea>
+        <button class="primary">Send</button>
+      </form>
+    </div>`;
+
+  const log = $("#log");
+  const input = $("#input");
+  let systemPrompt = room.systemPrompt;
+  const streaming = new Map(); // ai message id -> bubble element
+
+  function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 60; }
+  function scrollDown(force) { if (force || atBottom()) log.scrollTop = log.scrollHeight; }
+
+  function render(m) {
+    $(".empty", log)?.remove();
+    if (m.kind === "system-note") {
+      log.insertAdjacentHTML("beforeend", `<div class="note">${esc(m.text)}</div>`);
+      return;
+    }
+    const cls = m.kind === "ai" ? "ai" : m.author === myName ? "me" : "";
+    const el = document.createElement("div");
+    el.className = `msg ${cls}`;
+    el.innerHTML = `<div class="who">${esc(m.author)}</div><div class="bubble"></div>`;
+    $(".bubble", el).textContent = m.text;
+    log.appendChild(el);
+    return el;
+  }
+
+  if (room.messages.length === 0) {
+    log.innerHTML = `<div class="empty">Say hi to Claude. Use <b>Copy invite link</b> to bring someone else in — they'll see the whole conversation.</div>`;
+  }
+  room.messages.forEach(render);
+  scrollDown(true);
+
+  // Realtime
+  const es = new EventSource(`/api/rooms/${roomId}/events?name=${encodeURIComponent(myName)}`);
+  es.addEventListener("message", (e) => {
+    const stick = atBottom();
+    render(JSON.parse(e.data));
+    scrollDown(stick);
+  });
+  es.addEventListener("presence", (e) => {
+    const names = JSON.parse(e.data);
+    $("#presence").innerHTML = `<span class="dot"></span>${names.map(esc).join(", ")} + Claude`;
+  });
+  es.addEventListener("ai-start", (e) => {
+    const { id } = JSON.parse(e.data);
+    const stick = atBottom();
+    const el = render({ kind: "ai", author: "Claude", text: "" });
+    $(".bubble", el).classList.add("typing");
+    streaming.set(id, el);
+    scrollDown(stick);
+  });
+  es.addEventListener("ai-delta", (e) => {
+    const { id, delta } = JSON.parse(e.data);
+    const el = streaming.get(id);
+    if (!el) return;
+    const stick = atBottom();
+    $(".bubble", el).textContent += delta;
+    scrollDown(stick);
+  });
+  es.addEventListener("ai-done", (e) => {
+    const m = JSON.parse(e.data);
+    const el = streaming.get(m.id) ?? render(m);
+    const bubble = $(".bubble", el);
+    bubble.classList.remove("typing");
+    bubble.textContent = m.text;
+    streaming.delete(m.id);
+  });
+  es.addEventListener("system-prompt", (e) => {
+    systemPrompt = JSON.parse(e.data).systemPrompt;
+    if ($("#promptPanel").hidden) $("#promptText").value = systemPrompt;
+  });
+
+  // Sending
+  async function send() {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    input.style.height = "";
+    await fetch(`/api/rooms/${roomId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ author: myName, text }),
+    });
+  }
+  $("#compose").onsubmit = (e) => { e.preventDefault(); send(); };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "";
+    input.style.height = Math.min(input.scrollHeight + 2, 160) + "px";
+  });
+  input.focus();
+
+  // Share
+  $("#shareBtn").onclick = async () => {
+    const link = location.origin + location.pathname;
+    try { await navigator.clipboard.writeText(link); toast("Invite link copied"); }
+    catch { prompt("Copy this link:", link); }
+  };
+
+  // System prompt editor
+  const panel = $("#promptPanel");
+  $("#promptBtn").onclick = () => {
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) { $("#promptText").value = systemPrompt; $("#promptText").focus(); }
+  };
+  $("#promptCancel").onclick = () => { panel.hidden = true; };
+  $("#promptSave").onclick = async () => {
+    const value = $("#promptText").value.trim();
+    if (!value) return;
+    const res = await fetch(`/api/rooms/${roomId}/system-prompt`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ author: myName, systemPrompt: value }),
+    });
+    if (res.ok) { panel.hidden = true; toast("System prompt updated"); }
+  };
+}
+</script>
+</body>
+</html>
