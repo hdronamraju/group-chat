@@ -60,6 +60,8 @@
     background: var(--panel);
   }
   .prompt-panel textarea { min-height: 90px; resize: vertical; }
+  .ai-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .ai-grid textarea { min-height: 70px; resize: vertical; }
   .prompt-panel .row { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
   .prompt-panel .hint { color: var(--muted); font-size: 13px; margin-right: auto; }
 
@@ -75,6 +77,12 @@
   .msg.me .bubble { background: var(--me); color: var(--me-text); }
   .msg.ai .bubble { background: var(--ai); border: 1px solid var(--ai-line); }
   .msg.ai .who { color: var(--accent); font-weight: 600; }
+  .msg.ai.second .bubble { background: #eaf2f1; border-color: #b9d6d2; }
+  .msg.ai.second .who { color: #2b7f77; }
+  @media (prefers-color-scheme: dark) {
+    .msg.ai.second .bubble { background: #1b2a29; border-color: #2f4f4b; }
+    .msg.ai.second .who { color: #5fc0b5; }
+  }
   .note { align-self: center; font-size: 12px; color: var(--muted); }
   .typing::after { content: "▍"; animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -177,6 +185,8 @@ function enterRoom(room) {
       <header>
         <span class="title">Group chat</span>
         <span class="presence" id="presence"></span>
+        <button id="autoBtn" hidden></button>
+        <button id="aisBtn">AIs</button>
         <button id="promptBtn">System prompt</button>
         <button id="shareBtn" class="primary">Copy invite link</button>
       </header>
@@ -186,6 +196,19 @@ function enterRoom(room) {
           <span class="hint">Anyone in the chat can edit this. It applies from the next reply on.</span>
           <button type="button" id="promptCancel">Cancel</button>
           <button type="button" id="promptSave" class="primary">Save</button>
+        </div>
+      </div>
+      <div class="prompt-panel" id="aisPanel" hidden>
+        <div class="ai-grid">
+          <input id="ai1Name" placeholder="First AI name" maxlength="30" />
+          <input id="ai2Name" placeholder="Second AI name (blank = only one AI)" maxlength="30" />
+          <textarea id="ai1Persona" placeholder="Persona (optional), e.g. an optimist who loves big ideas"></textarea>
+          <textarea id="ai2Persona" placeholder="Persona (optional), e.g. a skeptic who pokes holes"></textarea>
+        </div>
+        <div class="row">
+          <label class="hint"><input type="checkbox" id="autoCheck" style="width:auto" /> Let the AIs keep talking to each other after each message</label>
+          <button type="button" id="aisCancel">Cancel</button>
+          <button type="button" id="aisSave" class="primary">Save</button>
         </div>
       </div>
       <div id="log"></div>
@@ -198,6 +221,9 @@ function enterRoom(room) {
   const log = $("#log");
   const input = $("#input");
   let systemPrompt = room.systemPrompt;
+  let ais = room.ais;
+  let autoChat = room.autoChat;
+  let aiBusy = false;
   const streaming = new Map(); // ai message id -> bubble element
 
   function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 60; }
@@ -209,7 +235,8 @@ function enterRoom(room) {
       log.insertAdjacentHTML("beforeend", `<div class="note">${esc(m.text)}</div>`);
       return;
     }
-    const cls = m.kind === "ai" ? "ai" : m.author === myName ? "me" : "";
+    const second = ais.length > 1 && m.author === ais[1].name ? " second" : "";
+    const cls = m.kind === "ai" ? "ai" + second : m.author === myName ? "me" : "";
     const el = document.createElement("div");
     el.className = `msg ${cls}`;
     el.innerHTML = `<div class="who">${esc(m.author)}</div><div class="bubble"></div>`;
@@ -233,12 +260,33 @@ function enterRoom(room) {
   });
   es.addEventListener("presence", (e) => {
     const names = JSON.parse(e.data);
-    $("#presence").innerHTML = `<span class="dot"></span>${names.map(esc).join(", ")} + Claude`;
+    lastNames = names;
+    drawPresence();
   });
+  let lastNames = [];
+  function drawPresence() {
+    $("#presence").innerHTML = `<span class="dot"></span>${[...lastNames, ...ais.map((a) => a.name)].map(esc).join(", ")}`;
+  }
+  function drawAuto() {
+    const btn = $("#autoBtn");
+    btn.hidden = ais.length < 2;
+    btn.textContent = autoChat ? (aiBusy ? "Stop AI chat" : "Auto-chat on") : "Let AIs talk";
+    btn.classList.toggle("primary", autoChat && aiBusy);
+  }
+  drawPresence();
+  drawAuto();
+  es.addEventListener("settings", (e) => {
+    ({ ais, autoChat } = JSON.parse(e.data));
+    drawPresence();
+    drawAuto();
+  });
+  es.addEventListener("ai-idle", () => { aiBusy = false; drawAuto(); });
   es.addEventListener("ai-start", (e) => {
-    const { id } = JSON.parse(e.data);
+    const { id, author } = JSON.parse(e.data);
+    aiBusy = true;
+    drawAuto();
     const stick = atBottom();
-    const el = render({ kind: "ai", author: "Claude", text: "" });
+    const el = render({ kind: "ai", author, text: "" });
     $(".bubble", el).classList.add("typing");
     streaming.set(id, el);
     scrollDown(stick);
@@ -291,6 +339,38 @@ function enterRoom(room) {
     const link = location.origin + location.pathname;
     try { await navigator.clipboard.writeText(link); toast("Invite link copied"); }
     catch { prompt("Copy this link:", link); }
+  };
+
+  // AIs
+  const aisPanel = $("#aisPanel");
+  $("#aisBtn").onclick = () => {
+    aisPanel.hidden = !aisPanel.hidden;
+    if (aisPanel.hidden) return;
+    $("#ai1Name").value = ais[0].name;
+    $("#ai1Persona").value = ais[0].persona;
+    $("#ai2Name").value = ais[1]?.name ?? "";
+    $("#ai2Persona").value = ais[1]?.persona ?? "";
+    $("#autoCheck").checked = autoChat;
+  };
+  $("#aisCancel").onclick = () => { aisPanel.hidden = true; };
+  $("#aisSave").onclick = async () => {
+    const list = [{ name: $("#ai1Name").value, persona: $("#ai1Persona").value }];
+    if ($("#ai2Name").value.trim()) list.push({ name: $("#ai2Name").value, persona: $("#ai2Persona").value });
+    const res = await fetch(`/api/rooms/${roomId}/ais`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ author: myName, ais: list, autoChat: $("#autoCheck").checked }),
+    });
+    if (res.ok) { aisPanel.hidden = true; toast("AIs updated"); }
+    else toast((await res.json()).error || "Couldn't save");
+  };
+  $("#autoBtn").onclick = () => {
+    // Stop while the AIs are talking; otherwise start a burst.
+    fetch(`/api/rooms/${roomId}/auto`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ on: aiBusy ? false : true, author: myName }),
+    });
   };
 
   // System prompt editor

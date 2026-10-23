@@ -13,7 +13,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const MODEL = process.env.MODEL || "claude-opus-5-5";
 const DATA_FILE = path.join(here, "data", "rooms.json");
-const AI_NAME = "Claude";
+const AUTO_TURNS = Number(process.env.AUTO_TURNS || 6); // AI-to-AI turns per burst
 
 const DEFAULT_PROMPT =
   "You are a helpful assistant participating in a group chat. Be concise and conversational.";
@@ -22,7 +22,7 @@ const client = new Anthropic();
 
 // ---- Room state ---------------------------------------------------------
 
-/** @type {Map<string, {id:string, systemPrompt:string, messages:any[], createdAt:number}>} */
+/** @type {Map<string, {id:string, systemPrompt:string, ais:{name:string, persona:string}[], autoChat:boolean, messages:any[], createdAt:number}>} */
 const rooms = new Map();
 /** room id -> Set of SSE responses */
 const listeners = new Map();
@@ -30,7 +30,11 @@ const listeners = new Map();
 const aiState = new Map();
 
 try {
-  for (const r of JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))) rooms.set(r.id, r);
+  for (const r of JSON.parse(fs.readFileSync(DATA_FILE, "utf8"))) {
+    r.ais ??= [{ name: "Claude", persona: "" }]; // rooms saved before multi-AI support
+    r.autoChat ??= false;
+    rooms.set(r.id, r);
+  }
 } catch {}
 
 let saveTimer;
@@ -65,11 +69,12 @@ function presence(roomId) {
 // The Messages API wants alternating user/assistant turns, so consecutive
 // human messages (from either person) are folded into one user turn, each
 // line tagged with who said it.
-function toApiMessages(room) {
+// Other AIs' messages are "user" turns too, tagged with their name.
+function toApiMessages(room, ai) {
   const out = [];
   for (const m of room.messages) {
     if (m.kind === "system-note" || m.error) continue;
-    const role = m.kind === "ai" ? "assistant" : "user";
+    const role = m.kind === "ai" && m.author === ai.name ? "assistant" : "user";
     const text = role === "user" ? `[${m.author}]: ${m.text}` : m.text;
     const last = out[out.length - 1];
     if (last && last.role === role) last.content += "\n" + text;
@@ -79,44 +84,70 @@ function toApiMessages(room) {
   return out;
 }
 
-function systemPrompt(room) {
+function systemPrompt(room, ai) {
+  const others = room.ais.filter((a) => a.name !== ai.name).map((a) => a.name);
   return (
     `${room.systemPrompt}\n\n` +
-    `You are "${AI_NAME}" in a shared chat room with more than one human. ` +
-    `Each human message is prefixed with the sender's name in brackets, like "[Name]: ...". ` +
+    (ai.persona ? `Your persona: ${ai.persona}\n\n` : "") +
+    `You are "${ai.name}" in a shared chat room with more than one human. ` +
+    (others.length
+      ? `Another AI, ${others.join(", ")}, is also in the room; you may talk with it directly. `
+      : "") +
+    `Each other participant's message is prefixed with the sender's name in brackets, like "[Name]: ...". ` +
     `Address people by name when it helps. Do not prefix your own replies with a name.`
   );
 }
 
-async function runAi(room) {
+// Humans get an answer from every AI in turn. With auto-chat on, the AIs then
+// keep replying to each other for up to AUTO_TURNS turns (or until stopped).
+async function runAi(room, { banterOnly = false } = {}) {
   const state = aiState.get(room.id) ?? { busy: false, pending: false };
   aiState.set(room.id, state);
   if (state.busy) {
-    state.pending = true; // answer again once the current reply finishes
+    if (!banterOnly) state.pending = true; // answer again once the current reply finishes
     return;
   }
   state.busy = true;
   try {
+    let skipHumans = banterOnly;
     do {
       state.pending = false;
-      await respond(room);
+      let last = null;
+      if (!skipHumans) {
+        for (const ai of [...room.ais]) {
+          await respond(room, ai);
+          last = ai;
+          if (state.pending) break;
+        }
+      }
+      skipHumans = false;
+      if (state.pending) continue;
+      last ??= [...room.messages].reverse().find((m) => m.kind === "ai");
+      for (let i = 0; room.autoChat && room.ais.length > 1 && i < AUTO_TURNS && !state.pending; i++) {
+        const idx = room.ais.findIndex((a) => a.name === last?.name || a.name === last?.author);
+        const next = room.ais[(idx + 1) % room.ais.length];
+        await respond(room, next);
+        last = next;
+      }
     } while (state.pending);
   } finally {
     state.busy = false;
+    broadcast(room.id, "ai-idle", {});
   }
 }
 
-async function respond(room) {
+async function respond(room, ai) {
+  if (!toApiMessages(room, ai).length) return; // nothing to answer yet
   const id = crypto.randomUUID();
-  broadcast(room.id, "ai-start", { id });
+  broadcast(room.id, "ai-start", { id, author: ai.name });
   let text = "";
   let error = false;
   try {
     const stream = client.beta.messages.stream({
       model: MODEL,
       max_tokens: 16000,
-      system: systemPrompt(room),
-      messages: toApiMessages(room),
+      system: systemPrompt(room, ai),
+      messages: toApiMessages(room, ai),
       output_config: { effort: "low" },
       // If a safety classifier declines, the API retries on a fallback model.
       betas: ["server-side-fallback-2026-07-01"],
@@ -135,7 +166,7 @@ async function respond(room) {
     text = `(Error talking to the model: ${err.message})`;
     error = true;
   }
-  const msg = { id, at: Date.now(), kind: "ai", author: AI_NAME, text: text.trim(), ...(error && { error }) };
+  const msg = { id, at: Date.now(), kind: "ai", author: ai.name, text: text.trim(), ...(error && { error }) };
   room.messages.push(msg);
   broadcast(room.id, "ai-done", msg);
   save();
@@ -177,6 +208,8 @@ const server = http.createServer(async (req, res) => {
     const room = {
       id: crypto.randomBytes(6).toString("base64url"),
       systemPrompt: DEFAULT_PROMPT,
+      ais: [{ name: "Claude", persona: "" }],
+      autoChat: false,
       messages: [],
       createdAt: Date.now(),
     };
@@ -191,7 +224,10 @@ const server = http.createServer(async (req, res) => {
 
   // GET /api/rooms/:id -> snapshot
   if (req.method === "GET" && !action) {
-    return json(res, 200, { id: room.id, systemPrompt: room.systemPrompt, messages: room.messages });
+    return json(res, 200, {
+      id: room.id, systemPrompt: room.systemPrompt, ais: room.ais, autoChat: room.autoChat,
+      messages: room.messages,
+    });
   }
 
   // GET /api/rooms/:id/events?name=... -> SSE stream
@@ -237,6 +273,40 @@ const server = http.createServer(async (req, res) => {
     broadcast(room.id, "system-prompt", { systemPrompt: prompt });
     addMessage(room, { kind: "system-note", author, text: `${author} updated the system prompt` });
     return json(res, 200, { ok: true });
+  }
+
+  // PUT /api/rooms/:id/ais {author, ais:[{name, persona}], autoChat}
+  if (req.method === "PUT" && action === "ais") {
+    const body = await readBody(req);
+    const author = clean(body.author, 40) || "Someone";
+    const ais = (Array.isArray(body.ais) ? body.ais : []).slice(0, 2).map((a) => ({
+      name: clean(a?.name, 30), persona: clean(a?.persona, 2000),
+    }));
+    const names = new Set(ais.map((a) => a.name.toLowerCase()));
+    if (!ais.length || names.size !== ais.length || names.has("")) {
+      return json(res, 400, { error: "each AI needs a unique name" });
+    }
+    const was = room.ais.length;
+    room.ais = ais;
+    room.autoChat = Boolean(body.autoChat) && ais.length > 1;
+    broadcast(room.id, "settings", { ais: room.ais, autoChat: room.autoChat });
+    addMessage(room, {
+      kind: "system-note", author,
+      text: `${author} updated the AIs (${ais.map((a) => a.name).join(" + ")}${room.autoChat ? ", auto-chat on" : ""})`,
+    });
+    json(res, 200, { ok: true });
+    if (ais.length > was) runAi(room, { banterOnly: true });
+    return;
+  }
+
+  // POST /api/rooms/:id/auto {on, author} -> toggle auto-chat; turning it on runs a burst
+  if (req.method === "POST" && action === "auto") {
+    const body = await readBody(req);
+    room.autoChat = Boolean(body.on) && room.ais.length > 1;
+    broadcast(room.id, "settings", { ais: room.ais, autoChat: room.autoChat });
+    json(res, 200, { ok: true });
+    if (room.autoChat) runAi(room, { banterOnly: true });
+    return;
   }
 
   json(res, 404, { error: "not found" });

@@ -5,6 +5,7 @@ A pared-down prototype: two humans and Claude in one shared conversation.
 - Human A opens `/`, enters a name, and creates a chat. They can start talking to Claude right away.
 - **Copy invite link** copies the room's URL (`/r/<id>`). Human B opens it, enters a name, and joins — they see the full history.
 - Everyone sees messages and Claude's replies stream in live. Claude sees every human message tagged with the sender's name.
+- **AIs** lets you add a second AI (name + optional persona each). Both answer every human message, and with auto-chat on they keep replying to each other for up to `AUTO_TURNS` turns (default 6). **Let AIs talk** / **Stop AI chat** controls it; a new human message steps in at any time.
 - Anyone can open **System prompt** to change Claude's instructions. A note in the chat records who changed it.
 
 ## Run
